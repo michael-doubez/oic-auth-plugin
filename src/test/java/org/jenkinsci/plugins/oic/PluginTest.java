@@ -2,6 +2,7 @@ package org.jenkinsci.plugins.oic;
 
 import com.github.tomakehurst.wiremock.core.WireMockConfiguration;
 import com.github.tomakehurst.wiremock.junit.WireMockRule;
+import com.github.tomakehurst.wiremock.matching.AnythingPattern;
 import com.google.api.client.auth.openidconnect.IdToken;
 import com.google.api.client.json.JsonFactory;
 import com.google.api.client.json.jackson2.JacksonFactory;
@@ -72,14 +73,14 @@ public class PluginTest {
         keyGen.initialize(2048);
         KeyPair keyPair = keyGen.generateKeyPair();
 
-        stubFor(get(urlPathEqualTo("/authorization")).willReturn(
+        stubFor(get(urlPathEqualTo("/authorization")).withQueryParam("foo", new AnythingPattern()).willReturn(
             aResponse()
                     .withStatus(302)
                     .withHeader("Content-Type", "text/html; charset=utf-8")
                     .withHeader("Location", jenkins.getRootUrl()+"securityRealm/finishLogin?state=state&code=code")
                     .withBody("")
         ));
-        stubFor(post(urlPathEqualTo("/token")).willReturn(
+        stubFor(post(urlPathEqualTo("/token")).withQueryParam("foo", new AnythingPattern()).willReturn(
             aResponse()
                 .withHeader("Content-Type", "text/html; charset=utf-8")
                 .withBody("{" +
@@ -149,8 +150,8 @@ public class PluginTest {
             super(
                  CLIENT_ID,
                 "secret",
-                "http://localhost:" + wireMockRule.port() + "/token",
-                "http://localhost:" + wireMockRule.port() + "/authorization",
+                "http://localhost:" + wireMockRule.port() + "/token?foo=bar",
+                "http://localhost:" + wireMockRule.port() + "/authorization?foo=bar",
                 null,
                 null,
                 null,
