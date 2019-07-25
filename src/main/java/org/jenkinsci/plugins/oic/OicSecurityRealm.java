@@ -378,7 +378,7 @@ public class OicSecurityRealm extends SecurityRealm {
             public HttpResponse onSuccess(String authorizationCode) {
                 try {
                     AuthorizationCodeTokenRequest tokenRequest = flow.newTokenRequest(authorizationCode)
-                        .setRedirectUri(buildOAuthRedirectUrl());
+                        .setRedirectUri(null);
                     // Supplying scope is not allowed when obtaining an access token with an authorization code.
                     tokenRequest.setScopes(Collections.<String>emptyList());
 
