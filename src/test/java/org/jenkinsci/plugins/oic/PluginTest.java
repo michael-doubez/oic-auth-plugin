@@ -28,7 +28,6 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import jenkins.model.Jenkins;
 import jenkins.security.LastGrantedAuthoritiesProperty;
-import org.acegisecurity.Authentication;
 import org.junit.Before;
 import org.junit.BeforeClass;
 import org.junit.Rule;
@@ -36,6 +35,8 @@ import org.junit.Test;
 import org.jvnet.hudson.test.JenkinsRule;
 import org.jvnet.hudson.test.Url;
 import org.kohsuke.stapler.Stapler;
+import org.springframework.security.core.Authentication;
+import org.springframework.security.core.context.SecurityContextHolder;
 
 import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
 import static com.github.tomakehurst.wiremock.client.WireMock.absent;
@@ -57,6 +58,9 @@ import static org.jenkinsci.plugins.oic.TestRealm.FULL_NAME_FIELD;
 import static org.jenkinsci.plugins.oic.TestRealm.GROUPS_FIELD;
 import static org.jenkinsci.plugins.oic.TestRealm.MANUAL_CONFIG_FIELD;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 /**
@@ -70,6 +74,7 @@ public class PluginTest {
     private static final String TEST_USER_EMAIL_ADDRESS = "test@jenkins.oic";
     private static final String TEST_USER_FULL_NAME = "Oic Test User";
     private static final String[] TEST_USER_GROUPS = new String[] {"group1", "group2"};
+    private static final String[] TEST_USER_GROUPS_REFRESHED = new String[] {"group1", "group2", "group3"};
     private static final List<Map<String, String>> TEST_USER_GROUPS_MAP = new ArrayList<>();
 
     @Rule
@@ -401,11 +406,13 @@ public class PluginTest {
         keyValues.put(FULL_NAME_FIELD, TEST_USER_FULL_NAME);
         keyValues.put(GROUPS_FIELD, TEST_USER_GROUPS);
 
+        String idToken = createIdToken(keyPair.getPrivate(), keyValues);
+
         wireMockRule.stubFor(post(urlPathEqualTo("/token"))
                 .willReturn(aResponse()
                         .withHeader("Content-Type", "text/html; charset=utf-8")
                         .withBody("{" + "\"id_token\": \""
-                                + createIdToken(keyPair.getPrivate(), keyValues) + "\","
+                                + idToken + "\","
                                 + "\"access_token\":\"AcCeSs_ToKeN\","
                                 + "\"token_type\":\"example\","
                                 + "\"expires_in\":3600,"
@@ -433,6 +440,7 @@ public class PluginTest {
 
         Authentication authentication = getAuthentication();
         assertEquals("Should be logged-in as " + TEST_USER_USERNAME, TEST_USER_USERNAME, authentication.getPrincipal());
+
         User user = User.get(String.valueOf(authentication.getPrincipal()));
         assertEquals("Full name should be " + TEST_USER_FULL_NAME, TEST_USER_FULL_NAME, user.getFullName());
         assertEquals(
@@ -445,6 +453,13 @@ public class PluginTest {
         assertTrue(
                 "User should be part of group " + TEST_USER_GROUPS[1],
                 user.getAuthorities().contains(TEST_USER_GROUPS[1]));
+
+        OicCredentials credentials = user.getProperty(OicCredentials.class);
+
+        assertNotNull(credentials);
+        assertEquals("AcCeSs_ToKeN", credentials.getAccessToken());
+        assertEquals("ReFrEsH_ToKeN", credentials.getRefreshToken());
+        assertEquals(idToken, credentials.getIdToken());
     }
 
     @Test
@@ -500,7 +515,7 @@ public class PluginTest {
 
         Authentication authentication = getAuthentication();
         assertEquals("Should be logged-in as " + TEST_USER_USERNAME, TEST_USER_USERNAME, authentication.getPrincipal());
-        User user = User.get(String.valueOf(authentication.getPrincipal()));
+        User user = User.get2(authentication);
         assertEquals("Full name should be " + TEST_USER_FULL_NAME, TEST_USER_FULL_NAME, user.getFullName());
         assertEquals(
                 "Email should be " + TEST_USER_EMAIL_ADDRESS,
@@ -526,6 +541,408 @@ public class PluginTest {
         oicsr.setWellKnownOpenIDConfigurationUrl(oicsr.getWellKnownOpenIDConfigurationUrl());
         assertEquals(
                 "All scopes of WellKnown should be used", "openid profile scope1 scope2 scope3", oicsr.getScopes());
+    }
+
+    @Test
+    public void testConfigurationWithAutoConfiguration_withRefreshToken() throws Exception {
+        configureWellKnown(null, null, "authorization_code", "refresh_token");
+        TestRealm oicsr = new TestRealm.Builder(wireMockRule)
+                .WithMinimalDefaults().WithAutomanualconfigure("auto").build();
+        assertTrue("Refresh token should be enabled", oicsr.isUseRefreshTokens());
+    }
+
+    @Test
+    public void testRefreshToken_validAndExtendedToken() throws Exception {
+        KeyPair keyPair = createKeyPair();
+
+        wireMockRule.stubFor(get(urlPathEqualTo("/authorization"))
+                .willReturn(aResponse()
+                        .withStatus(302)
+                        .withHeader("Content-Type", "text/html; charset=utf-8")
+                        .withHeader(
+                                "Location", jenkins.getRootUrl() + "securityRealm/finishLogin?state=state&code=code")
+                        .withBody("")));
+        Map<String, Object> keyValues = new HashMap<>();
+        keyValues.put(EMAIL_FIELD, TEST_USER_EMAIL_ADDRESS);
+        keyValues.put(FULL_NAME_FIELD, TEST_USER_FULL_NAME);
+        keyValues.put(GROUPS_FIELD, TEST_USER_GROUPS);
+
+        String idToken = createIdToken(keyPair.getPrivate(), keyValues);
+
+        wireMockRule.stubFor(post(urlPathEqualTo("/token"))
+                .willReturn(aResponse()
+                        .withHeader("Content-Type", "text/html; charset=utf-8")
+                        .withBody("{" + "\"id_token\": \""
+                                + idToken + "\","
+                                + "\"access_token\":\"AcCeSs_ToKeN\","
+                                + "\"token_type\":\"example\","
+                                + "\"expires_in\":3600,"
+                                + "\"refresh_token\":\"ReFrEsH_ToKeN\","
+                                + "\"example_parameter\":\"example_value\""
+                                + "}")));
+
+        wireMockRule.stubFor(get(urlPathEqualTo("/userinfo"))
+                .willReturn(aResponse()
+                        .withHeader("Content-Type", "application/json")
+                        .withBody("{\n" + "   \"sub\": \""
+                                + TEST_USER_USERNAME + "\",\n" + "   \""
+                                + FULL_NAME_FIELD + "\": \"" + TEST_USER_FULL_NAME + "\",\n" + "   \""
+                                + EMAIL_FIELD + "\": \"" + TEST_USER_EMAIL_ADDRESS + "\",\n" + "   \""
+                                + GROUPS_FIELD + "\": " + toJsonArray(TEST_USER_GROUPS) + "\n" + "  }")));
+
+        configureWellKnown(null, null, "authorization_code", "refresh_token");
+
+        TestRealm testRealm = new TestRealm(wireMockRule, null, EMAIL_FIELD, GROUPS_FIELD, AUTO_CONFIG_FIELD);
+
+        jenkins.setSecurityRealm(testRealm);
+
+        webClient.goTo(jenkins.getSecurityRealm().getLoginUrl());
+
+        Authentication authentication = getAuthentication();
+        User user = User.get2(authentication);
+
+        assertFalse(
+                "User should not be part of group " + TEST_USER_GROUPS_REFRESHED[2],
+                user.getAuthorities().contains(TEST_USER_GROUPS_REFRESHED[2]));
+
+        expire();
+
+        keyValues.put(GROUPS_FIELD, TEST_USER_GROUPS_REFRESHED);
+
+        idToken = createIdToken(keyPair.getPrivate(), keyValues);
+
+        wireMockRule.stubFor(post(urlPathEqualTo("/token"))
+                .willReturn(aResponse()
+                        .withHeader("Content-Type", "text/html; charset=utf-8")
+                        .withBody("{" + "\"id_token\": \""
+                                + idToken + "\","
+                                + "\"access_token\":\"AcCeSs_ToKeN\","
+                                + "\"token_type\":\"example\","
+                                + "\"expires_in\":3600,"
+                                + "\"refresh_token\":\"ReFrEsH_ToKeN\","
+                                + "\"example_parameter\":\"example_value\""
+                                + "}")));
+
+        wireMockRule.stubFor(get(urlPathEqualTo("/userinfo"))
+                .willReturn(aResponse()
+                        .withHeader("Content-Type", "application/json")
+                        .withBody("{\n" + "   \"sub\": \""
+                                + TEST_USER_USERNAME + "\",\n" + "   \""
+                                + FULL_NAME_FIELD + "\": \"" + TEST_USER_FULL_NAME + "\",\n" + "   \""
+                                + EMAIL_FIELD + "\": \"" + TEST_USER_EMAIL_ADDRESS + "\",\n" + "   \""
+                                + GROUPS_FIELD + "\": " + toJsonArray(TEST_USER_GROUPS_REFRESHED) + "\n" + "  }")));
+
+        webClient.goTo(jenkins.getSearchUrl());
+
+        user = User.get2(authentication);
+
+        assertTrue(
+                "User should be part of group " + TEST_USER_GROUPS_REFRESHED[2],
+                user.getAuthorities().contains(TEST_USER_GROUPS_REFRESHED[2]));
+
+        verify(postRequestedFor(urlPathEqualTo("/token")).withRequestBody(containing("grant_type=refresh_token")));
+    }
+
+    @Test
+    public void testRefreshTokenAndTokenExpiration_withoutRefreshToken() throws Exception {
+        KeyPair keyPair = createKeyPair();
+
+        wireMockRule.stubFor(get(urlPathEqualTo("/authorization"))
+                .willReturn(aResponse()
+                        .withStatus(302)
+                        .withHeader("Content-Type", "text/html; charset=utf-8")
+                        .withHeader(
+                                "Location", jenkins.getRootUrl() + "securityRealm/finishLogin?state=state&code=code")
+                        .withBody("")));
+        Map<String, Object> keyValues = new HashMap<>();
+        keyValues.put(EMAIL_FIELD, TEST_USER_EMAIL_ADDRESS);
+        keyValues.put(FULL_NAME_FIELD, TEST_USER_FULL_NAME);
+        keyValues.put(GROUPS_FIELD, TEST_USER_GROUPS);
+
+        String idToken = createIdToken(keyPair.getPrivate(), keyValues);
+
+        wireMockRule.stubFor(post(urlPathEqualTo("/token"))
+                .willReturn(aResponse()
+                        .withHeader("Content-Type", "text/html; charset=utf-8")
+                        .withBody("{" + "\"id_token\": \""
+                                + idToken + "\","
+                                + "\"access_token\":\"AcCeSs_ToKeN\","
+                                + "\"token_type\":\"example\","
+                                + "\"expires_in\":3600,"
+                                + "\"example_parameter\":\"example_value\""
+                                + "}")));
+
+        wireMockRule.stubFor(get(urlPathEqualTo("/userinfo"))
+                .willReturn(aResponse()
+                        .withHeader("Content-Type", "application/json")
+                        .withBody("{\n" + "   \"sub\": \""
+                                + TEST_USER_USERNAME + "\",\n" + "   \""
+                                + FULL_NAME_FIELD + "\": \"" + TEST_USER_FULL_NAME + "\",\n" + "   \""
+                                + EMAIL_FIELD + "\": \"" + TEST_USER_EMAIL_ADDRESS + "\",\n" + "   \""
+                                + GROUPS_FIELD + "\": " + toJsonArray(TEST_USER_GROUPS) + "\n" + "  }")));
+
+        configureWellKnown(null, null, "authorization_code");
+
+        TestRealm testRealm = new TestRealm(wireMockRule, null, EMAIL_FIELD, GROUPS_FIELD, AUTO_CONFIG_FIELD);
+
+        jenkins.setSecurityRealm(testRealm);
+
+        webClient.goTo(jenkins.getSecurityRealm().getLoginUrl());
+
+        expire();
+
+        webClient.assertFails(jenkins.getSecurityRealm().getLoginUrl(), 302);
+
+        verify(postRequestedFor(urlPathEqualTo("/token")).withRequestBody(notMatching(".*grant_type=refresh_token.*")));
+    }
+
+    @Test
+    public void testRefreshTokenWithTokenExpirationCheckDisabled_withoutRefreshToken() throws Exception {
+        KeyPair keyPair = createKeyPair();
+
+        wireMockRule.stubFor(get(urlPathEqualTo("/authorization"))
+                .willReturn(aResponse()
+                        .withStatus(302)
+                        .withHeader("Content-Type", "text/html; charset=utf-8")
+                        .withHeader(
+                                "Location", jenkins.getRootUrl() + "securityRealm/finishLogin?state=state&code=code")
+                        .withBody("")));
+        Map<String, Object> keyValues = new HashMap<>();
+        keyValues.put(EMAIL_FIELD, TEST_USER_EMAIL_ADDRESS);
+        keyValues.put(FULL_NAME_FIELD, TEST_USER_FULL_NAME);
+        keyValues.put(GROUPS_FIELD, TEST_USER_GROUPS);
+
+        String idToken = createIdToken(keyPair.getPrivate(), keyValues);
+
+        wireMockRule.stubFor(post(urlPathEqualTo("/token"))
+                .willReturn(aResponse()
+                        .withHeader("Content-Type", "text/html; charset=utf-8")
+                        .withBody("{" + "\"id_token\": \""
+                                + idToken + "\","
+                                + "\"access_token\":\"AcCeSs_ToKeN\","
+                                + "\"token_type\":\"example\","
+                                + "\"expires_in\":3600,"
+                                + "\"example_parameter\":\"example_value\""
+                                + "}")));
+
+        wireMockRule.stubFor(get(urlPathEqualTo("/userinfo"))
+                .willReturn(aResponse()
+                        .withHeader("Content-Type", "application/json")
+                        .withBody("{\n" + "   \"sub\": \""
+                                + TEST_USER_USERNAME + "\",\n" + "   \""
+                                + FULL_NAME_FIELD + "\": \"" + TEST_USER_FULL_NAME + "\",\n" + "   \""
+                                + EMAIL_FIELD + "\": \"" + TEST_USER_EMAIL_ADDRESS + "\",\n" + "   \""
+                                + GROUPS_FIELD + "\": " + toJsonArray(TEST_USER_GROUPS) + "\n" + "  }")));
+
+        configureWellKnown(null, null, "authorization_code");
+
+        TestRealm testRealm = new TestRealm(wireMockRule, null, EMAIL_FIELD, GROUPS_FIELD, AUTO_CONFIG_FIELD);
+
+        testRealm.setTokenExpirationCheckDisabled(true);
+
+        jenkins.setSecurityRealm(testRealm);
+
+        webClient.goTo(jenkins.getSecurityRealm().getLoginUrl());
+
+        expire();
+
+        webClient.goTo(jenkins.getSearchUrl());
+
+        verify(postRequestedFor(urlPathEqualTo("/token")).withRequestBody(notMatching(".*grant_type=refresh_token.*")));
+    }
+
+    @Test
+    public void testRefreshTokenWithTokenExpirationCheckDisabled_expiredRefreshToken() throws Exception {
+        KeyPair keyPair = createKeyPair();
+
+        wireMockRule.stubFor(get(urlPathEqualTo("/authorization"))
+                .willReturn(aResponse()
+                        .withStatus(302)
+                        .withHeader("Content-Type", "text/html; charset=utf-8")
+                        .withHeader(
+                                "Location", jenkins.getRootUrl() + "securityRealm/finishLogin?state=state&code=code")
+                        .withBody("")));
+        Map<String, Object> keyValues = new HashMap<>();
+        keyValues.put(EMAIL_FIELD, TEST_USER_EMAIL_ADDRESS);
+        keyValues.put(FULL_NAME_FIELD, TEST_USER_FULL_NAME);
+        keyValues.put(GROUPS_FIELD, TEST_USER_GROUPS);
+
+        String idToken = createIdToken(keyPair.getPrivate(), keyValues);
+
+        wireMockRule.stubFor(post(urlPathEqualTo("/token"))
+                .willReturn(aResponse()
+                        .withHeader("Content-Type", "text/html; charset=utf-8")
+                        .withBody("{" + "\"id_token\": \""
+                                + idToken + "\","
+                                + "\"access_token\":\"AcCeSs_ToKeN\","
+                                + "\"token_type\":\"example\","
+                                + "\"expires_in\":3600,"
+                                + "\"refresh_token\":\"ReFrEsH_ToKeN\","
+                                + "\"example_parameter\":\"example_value\""
+                                + "}")));
+
+        wireMockRule.stubFor(get(urlPathEqualTo("/userinfo"))
+                .willReturn(aResponse()
+                        .withHeader("Content-Type", "application/json")
+                        .withBody("{\n" + "   \"sub\": \""
+                                + TEST_USER_USERNAME + "\",\n" + "   \""
+                                + FULL_NAME_FIELD + "\": \"" + TEST_USER_FULL_NAME + "\",\n" + "   \""
+                                + EMAIL_FIELD + "\": \"" + TEST_USER_EMAIL_ADDRESS + "\",\n" + "   \""
+                                + GROUPS_FIELD + "\": " + toJsonArray(TEST_USER_GROUPS) + "\n" + "  }")));
+
+        configureWellKnown(null, null, "authorization_code", "refresh_token");
+
+        TestRealm testRealm = new TestRealm(wireMockRule, null, EMAIL_FIELD, GROUPS_FIELD, AUTO_CONFIG_FIELD);
+
+        testRealm.setTokenExpirationCheckDisabled(true);
+
+        jenkins.setSecurityRealm(testRealm);
+
+        webClient.goTo(jenkins.getSecurityRealm().getLoginUrl());
+
+        expire();
+
+        wireMockRule.stubFor(post(urlPathEqualTo("/token"))
+                .willReturn(aResponse()
+                        .withStatus(400)
+                        .withHeader("Content-Type", "application/json")
+                        .withBody("{ \"error\": \"invalid_grant\" }")));
+
+        webClient.goTo(jenkins.getSearchUrl(), "");
+
+        verify(postRequestedFor(urlPathEqualTo("/token")).withRequestBody(containing("grant_type=refresh_token")));
+    }
+
+    @Test
+    public void testRefreshTokenAndTokenExpiration_expiredRefreshToken() throws Exception {
+        KeyPair keyPair = createKeyPair();
+
+        wireMockRule.stubFor(get(urlPathEqualTo("/authorization"))
+                .willReturn(aResponse()
+                        .withStatus(302)
+                        .withHeader("Content-Type", "text/html; charset=utf-8")
+                        .withHeader(
+                                "Location", jenkins.getRootUrl() + "securityRealm/finishLogin?state=state&code=code")
+                        .withBody("")));
+        Map<String, Object> keyValues = new HashMap<>();
+        keyValues.put(EMAIL_FIELD, TEST_USER_EMAIL_ADDRESS);
+        keyValues.put(FULL_NAME_FIELD, TEST_USER_FULL_NAME);
+        keyValues.put(GROUPS_FIELD, TEST_USER_GROUPS);
+
+        String idToken = createIdToken(keyPair.getPrivate(), keyValues);
+
+        wireMockRule.stubFor(post(urlPathEqualTo("/token"))
+                .willReturn(aResponse()
+                        .withHeader("Content-Type", "text/html; charset=utf-8")
+                        .withBody("{" + "\"id_token\": \""
+                                + idToken + "\","
+                                + "\"access_token\":\"AcCeSs_ToKeN\","
+                                + "\"token_type\":\"example\","
+                                + "\"expires_in\":3600,"
+                                + "\"refresh_token\":\"ReFrEsH_ToKeN\","
+                                + "\"example_parameter\":\"example_value\""
+                                + "}")));
+
+        wireMockRule.stubFor(get(urlPathEqualTo("/userinfo"))
+                .willReturn(aResponse()
+                        .withHeader("Content-Type", "application/json")
+                        .withBody("{\n" + "   \"sub\": \""
+                                + TEST_USER_USERNAME + "\",\n" + "   \""
+                                + FULL_NAME_FIELD + "\": \"" + TEST_USER_FULL_NAME + "\",\n" + "   \""
+                                + EMAIL_FIELD + "\": \"" + TEST_USER_EMAIL_ADDRESS + "\",\n" + "   \""
+                                + GROUPS_FIELD + "\": " + toJsonArray(TEST_USER_GROUPS) + "\n" + "  }")));
+
+        configureWellKnown(null, null, "authorization_code", "refresh_token");
+
+        TestRealm testRealm = new TestRealm(wireMockRule, null, EMAIL_FIELD, GROUPS_FIELD, AUTO_CONFIG_FIELD);
+
+        jenkins.setSecurityRealm(testRealm);
+
+        webClient.goTo(jenkins.getSecurityRealm().getLoginUrl());
+
+        expire();
+
+        wireMockRule.stubFor(post(urlPathEqualTo("/token"))
+                .willReturn(aResponse()
+                        .withStatus(400)
+                        .withHeader("Content-Type", "application/json")
+                        .withBody("{ \"error\": \"invalid_grant\" }")));
+
+        webClient.assertFails(jenkins.getSearchUrl(), 401);
+
+        verify(postRequestedFor(urlPathEqualTo("/token")).withRequestBody(containing("grant_type=refresh_token")));
+    }
+
+    @Test
+    public void testTokenExpiration_withoutExpiresInValue() throws Exception {
+        KeyPair keyPair = createKeyPair();
+
+        wireMockRule.stubFor(get(urlPathEqualTo("/authorization"))
+                .willReturn(aResponse()
+                        .withStatus(302)
+                        .withHeader("Content-Type", "text/html; charset=utf-8")
+                        .withHeader(
+                                "Location", jenkins.getRootUrl() + "securityRealm/finishLogin?state=state&code=code")
+                        .withBody("")));
+        Map<String, Object> keyValues = new HashMap<>();
+        keyValues.put(EMAIL_FIELD, TEST_USER_EMAIL_ADDRESS);
+        keyValues.put(FULL_NAME_FIELD, TEST_USER_FULL_NAME);
+        keyValues.put(GROUPS_FIELD, TEST_USER_GROUPS);
+
+        String idToken = createIdToken(keyPair.getPrivate(), keyValues);
+
+        wireMockRule.stubFor(post(urlPathEqualTo("/token"))
+                .willReturn(aResponse()
+                        .withHeader("Content-Type", "text/html; charset=utf-8")
+                        .withBody("{" + "\"id_token\": \""
+                                + idToken + "\","
+                                + "\"access_token\":\"AcCeSs_ToKeN\","
+                                + "\"token_type\":\"example\","
+                                + "\"expires_in\":0,"
+                                + "\"example_parameter\":\"example_value\""
+                                + "}")));
+
+        wireMockRule.stubFor(get(urlPathEqualTo("/userinfo"))
+                .willReturn(aResponse()
+                        .withHeader("Content-Type", "application/json")
+                        .withBody("{\n" + "   \"sub\": \""
+                                + TEST_USER_USERNAME + "\",\n" + "   \""
+                                + FULL_NAME_FIELD + "\": \"" + TEST_USER_FULL_NAME + "\",\n" + "   \""
+                                + EMAIL_FIELD + "\": \"" + TEST_USER_EMAIL_ADDRESS + "\",\n" + "   \""
+                                + GROUPS_FIELD + "\": " + toJsonArray(TEST_USER_GROUPS) + "\n" + "  }")));
+
+        configureWellKnown(null, null, "authorization_code", "refresh_token");
+
+        TestRealm testRealm = new TestRealm(wireMockRule, null, EMAIL_FIELD, GROUPS_FIELD, AUTO_CONFIG_FIELD);
+
+        jenkins.setSecurityRealm(testRealm);
+
+        webClient.goTo(jenkins.getSecurityRealm().getLoginUrl());
+
+        Authentication authentication = getAuthentication();
+        User user = User.get2(authentication);
+        OicCredentials credentials = user.getProperty(OicCredentials.class);
+
+        assertNotNull(credentials);
+        assertNull(credentials.getExpiresAtMillis());
+    }
+
+    private void expire() throws Exception {
+        webClient.executeOnServer(() -> {
+            Authentication authentication = SecurityContextHolder.getContext().getAuthentication();
+            User user = User.get2(authentication);
+            OicCredentials credentials = user.getProperty(OicCredentials.class);
+
+            user.addProperty(new OicCredentials(
+                    credentials.getAccessToken(),
+                    credentials.getIdToken(),
+                    credentials.getRefreshToken(),
+                    60L,
+                    Clock.SYSTEM.currentTimeMillis() - 3600,
+                    60L));
+
+            return null;
+        });
     }
 
     @Test
@@ -712,7 +1129,7 @@ public class PluginTest {
         jenkins.setSecurityRealm(new TestRealm(wireMockRule, "http://localhost:" + wireMockRule.port() + "/userinfo"));
 
         assertEquals(
-                "Shouldn't be authenticated", getAuthentication().getPrincipal(), Jenkins.ANONYMOUS.getPrincipal());
+                "Shouldn't be authenticated", getAuthentication().getPrincipal(), Jenkins.ANONYMOUS2.getPrincipal());
 
         webClient.goTo(jenkins.getSecurityRealm().getLoginUrl());
 
@@ -1280,6 +1697,10 @@ public class PluginTest {
     }
 
     private void configureWellKnown(String endSessionUrl, String scopesSupported) {
+        configureWellKnown(endSessionUrl, scopesSupported, "authorization_code");
+    }
+
+    private void configureWellKnown(String endSessionUrl, String scopesSupported, String... grantTypesSupported) {
         String authUrl = "\"http://localhost:" + wireMockRule.port() + "/authorization\"";
         String tokenUrl = "\"http://localhost:" + wireMockRule.port() + "/token\"";
         String userInfoUrl = "\"http://localhost:" + wireMockRule.port() + "/userinfo\"";
@@ -1293,12 +1714,14 @@ public class PluginTest {
                                 "{\"authorization_endpoint\": %s, \"token_endpoint\":%s, "
                                         + "\"userinfo_endpoint\":%s,\"jwks_uri\":%s, \"scopes_supported\": "
                                         + scopesSupported + ", "
-                                        + "\"end_session_endpoint\":%s}",
+                                        + "\"end_session_endpoint\":%s,"
+                                        + "\"grant_types_supported\": %s}",
                                 authUrl,
                                 tokenUrl,
                                 userInfoUrl,
                                 jwksUrl,
-                                endSessionUrlStr))));
+                                endSessionUrlStr,
+                                toJsonArray(grantTypesSupported)))));
     }
 
     @Test
@@ -1325,7 +1748,7 @@ public class PluginTest {
             logoutURL[0] = oicsr.getPostLogOutUrl2(Stapler.getCurrentRequest(), Jenkins.ANONYMOUS2);
             return null;
         });
-        assertEquals("http://provider/logout?id_token_hint=null&state=null", logoutURL[0]);
+        assertEquals("http://provider/logout?state=null", logoutURL[0]);
     }
 
     @Test
@@ -1343,7 +1766,7 @@ public class PluginTest {
             return null;
         });
         assertEquals(
-                "http://provider/logout?id_token_hint=null&state=null&post_logout_redirect_uri=http%3A%2F%2Fsee.it%2F%3Fcat%26color%3Dwhite",
+                "http://provider/logout?state=null&post_logout_redirect_uri=http%3A%2F%2Fsee.it%2F%3Fcat%26color%3Dwhite",
                 logoutURL[0]);
     }
 
@@ -1509,7 +1932,7 @@ public class PluginTest {
             return webClient.executeOnServer(new Callable<Authentication>() {
                 @Override
                 public Authentication call() throws Exception {
-                    return jenkins.getAuthentication();
+                    return jenkins.getAuthentication2();
                 }
             });
         } catch (Exception e) {

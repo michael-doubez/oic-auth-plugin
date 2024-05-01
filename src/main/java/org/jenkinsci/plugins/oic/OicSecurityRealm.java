@@ -28,6 +28,9 @@ import com.google.api.client.auth.oauth2.AuthorizationCodeTokenRequest;
 import com.google.api.client.auth.oauth2.BearerToken;
 import com.google.api.client.auth.oauth2.ClientParametersAuthentication;
 import com.google.api.client.auth.oauth2.Credential.AccessMethod;
+import com.google.api.client.auth.oauth2.RefreshTokenRequest;
+import com.google.api.client.auth.oauth2.TokenErrorResponse;
+import com.google.api.client.auth.oauth2.TokenResponseException;
 import com.google.api.client.auth.openidconnect.HttpTransportFactory;
 import com.google.api.client.auth.openidconnect.IdToken;
 import com.google.api.client.http.BasicAuthentication;
@@ -53,10 +56,10 @@ import hudson.Extension;
 import hudson.Util;
 import hudson.model.Descriptor;
 import hudson.model.User;
+import hudson.security.ChainedServletFilter;
 import hudson.security.SecurityRealm;
 import hudson.tasks.Mailer;
 import hudson.util.FormValidation;
-import hudson.util.HttpResponses;
 import hudson.util.Secret;
 import io.burt.jmespath.Expression;
 import io.burt.jmespath.JmesPath;
@@ -71,6 +74,7 @@ import java.net.URL;
 import java.net.URLEncoder;
 import java.nio.charset.Charset;
 import java.security.GeneralSecurityException;
+import java.time.Clock;
 import java.time.LocalDateTime;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
@@ -84,7 +88,14 @@ import java.util.Random;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.regex.Pattern;
+import javax.servlet.Filter;
+import javax.servlet.FilterChain;
+import javax.servlet.FilterConfig;
 import javax.servlet.ServletException;
+import javax.servlet.ServletRequest;
+import javax.servlet.ServletResponse;
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
 import jenkins.model.Jenkins;
 import jenkins.security.SecurityListener;
 import org.apache.commons.lang.StringUtils;
@@ -95,9 +106,11 @@ import org.kohsuke.stapler.DataBoundSetter;
 import org.kohsuke.stapler.Header;
 import org.kohsuke.stapler.HttpRedirect;
 import org.kohsuke.stapler.HttpResponse;
+import org.kohsuke.stapler.HttpResponses;
 import org.kohsuke.stapler.QueryParameter;
 import org.kohsuke.stapler.StaplerRequest;
 import org.kohsuke.stapler.StaplerResponse;
+import org.kohsuke.stapler.WebApp;
 import org.kohsuke.stapler.interceptor.RequirePOST;
 import org.springframework.security.authentication.AnonymousAuthenticationToken;
 import org.springframework.security.authentication.AuthenticationManager;
@@ -109,6 +122,7 @@ import org.springframework.security.core.GrantedAuthority;
 import org.springframework.security.core.authority.SimpleGrantedAuthority;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.security.crypto.bcrypt.BCrypt;
+import org.springframework.util.Assert;
 
 import static org.apache.commons.lang.StringUtils.isNotBlank;
 
@@ -164,6 +178,7 @@ public class OicSecurityRealm extends SecurityRealm implements Serializable {
     private Secret escapeHatchSecret = null;
     private String escapeHatchGroup = null;
     private String automanualconfigure = null;
+    private boolean useRefreshTokens = false;
 
     /** flag to clear overrideScopes
      */
@@ -195,6 +210,14 @@ public class OicSecurityRealm extends SecurityRealm implements Serializable {
      */
     private boolean nonceDisabled = false;
 
+    /** Flag to disable token expiration check
+     */
+    private boolean tokenExpirationCheckDisabled = false;
+
+    /** Additional number of seconds to add to token expiration
+     */
+    private Long allowedTokenExpirationClockSkewSeconds = 60L;
+
     /** Date of wellknown configuration expiration
      */
     private transient LocalDateTime wellKnownExpires = null;
@@ -213,6 +236,10 @@ public class OicSecurityRealm extends SecurityRealm implements Serializable {
     /** Random generator needed for robust random wait
      */
     private static final Random RANDOM = new Random();
+
+    /** Clock used for token expiration check
+     */
+    private static final Clock CLOCK = Clock.systemUTC();
 
     /** Runtime context to compile JMESPath
      */
@@ -303,10 +330,12 @@ public class OicSecurityRealm extends SecurityRealm implements Serializable {
             String endSessionEndpoint,
             String scopes,
             String automanualconfigure,
-            Boolean disableSslVerification)
+            Boolean disableSslVerification,
+            Boolean useRefreshTokens)
             throws IOException {
         // Needed in DataBoundSetter
         this.disableSslVerification = Util.fixNull(disableSslVerification, Boolean.FALSE);
+        this.useRefreshTokens = Util.fixNull(useRefreshTokens, Boolean.FALSE);
         this.httpTransport = constructHttpTransport(this.disableSslVerification);
         this.clientId = clientId;
         this.clientSecret = clientSecret != null && !clientSecret.toLowerCase().equals(NO_SECRET)
@@ -470,6 +499,10 @@ public class OicSecurityRealm extends SecurityRealm implements Serializable {
         return automanualconfigure;
     }
 
+    public boolean isUseRefreshTokens() {
+        return useRefreshTokens;
+    }
+
     public boolean isOverrideScopesDefined() {
         return overrideScopes != null;
     }
@@ -496,6 +529,14 @@ public class OicSecurityRealm extends SecurityRealm implements Serializable {
 
     public boolean isNonceDisabled() {
         return nonceDisabled;
+    }
+
+    public boolean isTokenExpirationCheckDisabled() {
+        return tokenExpirationCheckDisabled;
+    }
+
+    public Long getAllowedTokenExpirationClockSkewSeconds() {
+        return allowedTokenExpirationClockSkewSeconds;
     }
 
     public boolean isAutoConfigure() {
@@ -538,6 +579,10 @@ public class OicSecurityRealm extends SecurityRealm implements Serializable {
             }
             this.applyOverrideScopes();
             this.endSessionEndpoint = Util.fixNull(config.getEndSessionEndpoint(), this.endSessionEndpoint);
+
+            if (config.getGrantTypesSupported() != null) {
+                this.useRefreshTokens = config.getGrantTypesSupported().contains("refresh_token");
+            }
 
             setWellKnownExpires(response.getHeaders());
         } catch (MalformedURLException e) {
@@ -753,6 +798,16 @@ public class OicSecurityRealm extends SecurityRealm implements Serializable {
         this.nonceDisabled = nonceDisabled;
     }
 
+    @DataBoundSetter
+    public void setTokenExpirationCheckDisabled(boolean tokenExpirationCheckDisabled) {
+        this.tokenExpirationCheckDisabled = tokenExpirationCheckDisabled;
+    }
+
+    @DataBoundSetter
+    public void setAllowedTokenExpirationClockSkewSeconds(Long allowedTokenExpirationClockSkewSeconds) {
+        this.allowedTokenExpirationClockSkewSeconds = allowedTokenExpirationClockSkewSeconds;
+    }
+
     @Override
     public String getLoginUrl() {
         // Login begins with our doCommenceLogin(String,String) method
@@ -762,6 +817,21 @@ public class OicSecurityRealm extends SecurityRealm implements Serializable {
     @Override
     public String getAuthenticationGatewayUrl() {
         return "securityRealm/escapeHatch";
+    }
+
+    @Override
+    public Filter createFilter(FilterConfig filterConfig) {
+        return new ChainedServletFilter(super.createFilter(filterConfig), new Filter() {
+            @Override
+            public void doFilter(ServletRequest request, ServletResponse response, FilterChain chain)
+                    throws IOException, ServletException {
+
+                if (OicSecurityRealm.this.handleTokenExpiration(
+                        (HttpServletRequest) request, (HttpServletResponse) response)) {
+                    chain.doFilter(request, response);
+                }
+            }
+        });
     }
 
     /*
@@ -902,8 +972,6 @@ public class OicSecurityRealm extends SecurityRealm implements Serializable {
                         return HttpResponses.errorWithoutStack(401, "Unauthorized");
                     }
 
-                    this.setIdToken(response.getIdToken());
-
                     GenericJson userInfo = null;
                     if (!Strings.isNullOrEmpty(userInfoServerUrl)) {
                         userInfo = getUserInfo(flow, response.getAccessToken());
@@ -919,7 +987,15 @@ public class OicSecurityRealm extends SecurityRealm implements Serializable {
 
                     flow.createAndStoreCredential(response, null);
 
-                    loginAndSetUserData(username.toString(), idToken, userInfo);
+                    OicCredentials credentials = new OicCredentials(
+                            response.getAccessToken(),
+                            response.getIdToken(),
+                            response.getRefreshToken(),
+                            response.getExpiresInSeconds(),
+                            CLOCK.millis(),
+                            OicSecurityRealm.this.getAllowedTokenExpirationClockSkewSeconds());
+
+                    loginAndSetUserData(username.toString(), idToken, userInfo, credentials);
 
                     return new HttpRedirect(redirectOnFinish);
 
@@ -1024,7 +1100,7 @@ public class OicSecurityRealm extends SecurityRealm implements Serializable {
     }
 
     private UsernamePasswordAuthenticationToken loginAndSetUserData(
-            String userName, IdToken idToken, GenericJson userInfo) throws IOException {
+            String userName, IdToken idToken, GenericJson userInfo, OicCredentials credentials) throws IOException {
 
         List<GrantedAuthority> grantedAuthorities = determineAuthorities(idToken, userInfo);
         if (LOGGER.isLoggable(Level.FINEST)) {
@@ -1056,6 +1132,8 @@ public class OicSecurityRealm extends SecurityRealm implements Serializable {
         if (fullName != null) {
             user.setFullName(fullName);
         }
+
+        user.addProperty(credentials);
 
         OicUserDetails userDetails = new OicUserDetails(userName, grantedAuthorities);
         SecurityListener.fireAuthenticated2(userDetails);
@@ -1186,9 +1264,26 @@ public class OicSecurityRealm extends SecurityRealm implements Serializable {
         OicSession oicSession = OicSession.getCurrent();
         if (oicSession != null) {
             // session will be invalidated but we still need this data for our redirect.
-            req.setAttribute(ID_TOKEN_REQUEST_ATTRIBUTE, oicSession.getIdToken());
             req.setAttribute(STATE_REQUEST_ATTRIBUTE, oicSession.getState());
         }
+
+        Authentication authentication = SecurityContextHolder.getContext().getAuthentication();
+        User user = User.get2(authentication);
+
+        Assert.notNull(user, "User must not be null");
+
+        OicCredentials credentials = user.getProperty(OicCredentials.class);
+
+        if (credentials != null) {
+            if (this.logoutFromOpenidProvider && !Strings.isNullOrEmpty(this.endSessionEndpoint)) {
+                // This ensures that token will be expired at the right time with API Key calls, but no refresh can be
+                // made.
+                user.addProperty(new OicCredentials(null, null, null, CLOCK.millis()));
+            }
+
+            req.setAttribute(ID_TOKEN_REQUEST_ATTRIBUTE, credentials.getIdToken());
+        }
+
         super.doLogout(req, rsp);
     }
 
@@ -1196,8 +1291,18 @@ public class OicSecurityRealm extends SecurityRealm implements Serializable {
     public String getPostLogOutUrl2(StaplerRequest req, Authentication auth) {
         if (this.logoutFromOpenidProvider && !Strings.isNullOrEmpty(this.endSessionEndpoint)) {
             StringBuilder openidLogoutEndpoint = new StringBuilder(this.endSessionEndpoint);
-            openidLogoutEndpoint.append("?id_token_hint=").append(req.getAttribute(ID_TOKEN_REQUEST_ATTRIBUTE));
-            openidLogoutEndpoint.append("&state=").append(req.getAttribute(STATE_REQUEST_ATTRIBUTE));
+
+            List<String> queryParams = new ArrayList<>();
+
+            String idToken = (String) req.getAttribute(ID_TOKEN_REQUEST_ATTRIBUTE);
+
+            if (!Strings.isNullOrEmpty(idToken)) {
+                queryParams.add(String.join("=", "id_token_hint", idToken));
+            }
+
+            queryParams.add(String.join("=", "state", (String) req.getAttribute(STATE_REQUEST_ATTRIBUTE)));
+
+            openidLogoutEndpoint.append("?").append(String.join("&", queryParams));
 
             if (this.postLogoutRedirectUrl != null) {
                 try {
@@ -1250,6 +1355,174 @@ public class OicSecurityRealm extends SecurityRealm implements Serializable {
             return HttpResponses.errorWithoutStack(401, "Unauthorized");
         }
         return currentSession.finishLogin(request, buildAuthorizationCodeFlow());
+    }
+
+    /**
+     * Handles Token Expiration.
+     * @throws IOException a low level exception
+     */
+    public boolean handleTokenExpiration(HttpServletRequest httpRequest, HttpServletResponse httpResponse)
+            throws IOException, ServletException {
+        Authentication authentication = SecurityContextHolder.getContext().getAuthentication();
+
+        if (httpRequest.getRequestURI().endsWith("/logout")) {
+            // No need to refresh token when logging out
+            return true;
+        }
+
+        if (authentication == null || authentication instanceof AnonymousAuthenticationToken) {
+            return true;
+        }
+
+        User user = User.get2(authentication);
+
+        if (user == null) {
+            return true;
+        }
+
+        OicCredentials credentials = user.getProperty(OicCredentials.class);
+
+        if (credentials == null) {
+            return true;
+        }
+
+        if (isExpired(credentials)) {
+            if (isUseRefreshTokens() && !Strings.isNullOrEmpty(credentials.getRefreshToken())) {
+                return refreshExpiredToken(user.getId(), credentials, httpRequest, httpResponse);
+            } else if (!isTokenExpirationCheckDisabled()) {
+                redirectOrRejectRequest(httpRequest, httpResponse);
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private void redirectOrRejectRequest(HttpServletRequest req, HttpServletResponse res)
+            throws IOException, ServletException {
+        if (req.getSession(false) != null || Strings.isNullOrEmpty(req.getHeader("Authorization"))) {
+            WebApp.get(Jenkins.get().servletContext).getSomeStapler().invoke(req, res, Jenkins.get(), getLoginUrl());
+        } else {
+            res.sendError(HttpServletResponse.SC_UNAUTHORIZED, "Token expired");
+        }
+    }
+
+    public boolean isExpired(OicCredentials credentials) {
+        if (credentials.getExpiresAtMillis() == null) {
+            return false;
+        }
+
+        return CLOCK.millis() >= credentials.getExpiresAtMillis();
+    }
+
+    private boolean refreshExpiredToken(
+            String expectedUsername,
+            OicCredentials credentials,
+            HttpServletRequest httpRequest,
+            HttpServletResponse httpResponse)
+            throws IOException {
+        AuthorizationCodeFlow flow = buildAuthorizationCodeFlow();
+
+        RefreshTokenRequest request = new RefreshTokenRequest(
+                        flow.getTransport(),
+                        flow.getJsonFactory(),
+                        new GenericUrl(flow.getTokenServerEncodedUrl()),
+                        credentials.getRefreshToken())
+                .setClientAuthentication(flow.getClientAuthentication())
+                .setResponseClass(OicTokenResponse.class);
+
+        try {
+            OicTokenResponse tokenResponse = (OicTokenResponse) request.execute();
+
+            LOGGER.log(Level.FINE, () -> "Token refresh request " + httpRequest.getRequestURI());
+
+            return handleTokenRefreshResponse(flow, expectedUsername, credentials, tokenResponse, httpResponse);
+        } catch (TokenResponseException e) {
+            handleTokenRefreshException(e, httpResponse);
+            return false;
+        }
+    }
+
+    private boolean handleTokenRefreshResponse(
+            AuthorizationCodeFlow flow,
+            String expectedUsername,
+            OicCredentials credentials,
+            OicTokenResponse tokenResponse,
+            HttpServletResponse httpResponse)
+            throws IOException {
+        String refreshToken = tokenResponse.getRefreshToken();
+        String idToken = tokenResponse.getIdToken();
+
+        // Refresh Token Flow is not required to send new ID or Refresh Token, so re-use if not received
+        if (idToken == null) {
+            idToken = credentials.getIdToken();
+            tokenResponse.setIdToken(credentials.getIdToken());
+        }
+
+        if (refreshToken == null) {
+            refreshToken = credentials.getRefreshToken();
+        }
+
+        OicCredentials refreshedCredentials = new OicCredentials(
+                tokenResponse.getAccessToken(),
+                idToken,
+                refreshToken,
+                tokenResponse.getExpiresInSeconds(),
+                CLOCK.millis(),
+                getAllowedTokenExpirationClockSkewSeconds());
+
+        GenericJson userInfo = null;
+        IdToken parsedIdToken;
+
+        try {
+            parsedIdToken = tokenResponse.parseIdToken();
+        } catch (IllegalArgumentException e) {
+            httpResponse.sendError(HttpServletResponse.SC_FORBIDDEN, Messages.OicSecurityRealm_IdTokenParseError());
+            return false;
+        }
+
+        if (!validateIdToken(parsedIdToken)) {
+            httpResponse.sendError(HttpServletResponse.SC_FORBIDDEN, "Forbidden");
+            return false;
+        }
+
+        if (failedCheckOfTokenField(parsedIdToken)) {
+            httpResponse.sendError(HttpServletResponse.SC_FORBIDDEN, "Forbidden");
+            return false;
+        }
+
+        if (!Strings.isNullOrEmpty(userInfoServerUrl)) {
+            userInfo = getUserInfo(flow, tokenResponse.getAccessToken());
+        }
+
+        String username = determineStringField(userNameFieldExpr, parsedIdToken, userInfo);
+
+        if (!expectedUsername.equals(username)) {
+            httpResponse.sendError(
+                    HttpServletResponse.SC_UNAUTHORIZED, "User name was not the same after refresh request");
+            return false;
+        }
+
+        loginAndSetUserData(username, parsedIdToken, userInfo, refreshedCredentials);
+
+        return true;
+    }
+
+    private void handleTokenRefreshException(TokenResponseException e, HttpServletResponse httpResponse)
+            throws IOException {
+        TokenErrorResponse details = e.getDetails();
+
+        if ("invalid_grant".equals(details.getError())) {
+            // RT expired or session terminated
+            if (!isTokenExpirationCheckDisabled()) {
+                httpResponse.sendError(HttpServletResponse.SC_UNAUTHORIZED, "Token expired");
+            }
+        } else {
+            LOGGER.warning("Token response error: " + details.getError() + ", error description: "
+                    + details.getErrorDescription());
+            httpResponse.sendError(
+                    HttpServletResponse.SC_INTERNAL_SERVER_ERROR, "Token refresh error, check server logs");
+        }
     }
 
     @Extension
